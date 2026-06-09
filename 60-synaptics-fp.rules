@@ -1,0 +1,10 @@
+# Grant plugdev rw access to the Synaptics 06cb:00e7 fingerprint sensor so
+# the fpdrv binary can talk to it without root.
+#
+# Install with:
+#   sudo cp 60-synaptics-fp.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --attr-match=idVendor=06cb --attr-match=idProduct=00e7
+#
+# Then unplug+replug the sensor, or reboot, for the rule to take full effect.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00e7", MODE="0660", GROUP="plugdev"

@@ -1,0 +1,28 @@
+# Build artifacts
+*.o
+*.so
+/fpdrv
+
+# Proprietary Windows driver binaries — do NOT redistribute (copyright).
+/firmware/
+
+# USB captures — large, and contain this host's pairing/session material.
+/captures/
+
+# Reverse-engineering tooling (DLL patchers, key-derivation, VM setup notes).
+# Tied to proprietary binaries and not needed to build or run the driver.
+/tools/
+
+# Host pairing secrets, should they ever land in-tree.
+*pairdata*
+*.pem
+*.key
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Personal / editor / agent state
+/.claude/
+claude-session.txt
+/--out/

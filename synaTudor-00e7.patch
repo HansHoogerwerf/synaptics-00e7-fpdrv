@@ -1,0 +1,510 @@
+diff --git a/cli/src/cli.c b/cli/src/cli.c
+index 0edc8ef..a3e05e5 100644
+--- a/cli/src/cli.c
++++ b/cli/src/cli.c
+@@ -27,6 +27,8 @@ void cli_main_loop(struct tudor_device *device) {
+         puts("  i - identify finger");
+         puts("  q - query information about enrolled fingers");
+         puts("  w - wipe enrolled finger(s)");
++        puts("  u - unpair sensor (WBIO IOCTL 0x442040 -> DoUnpairing)");
++        puts("  p - pair sensor (WBIO IOCTL 0x44002C -> OnConnectSecure -> DoPairing)");
+         puts("  s - shutdown driver");
+ 
+         printf("> ");
+@@ -213,6 +215,38 @@ void cli_main_loop(struct tudor_device *device) {
+                 int num_wiped = tudor_wipe_records(device, all_guids ? NULL: &guid, finger);
+                 printf("Succesfully wiped %d enrolled finger(s)\n", num_wiped);
+             } goto cmdend;
++            case 'u': {
++                printf("This invokes the sensor's WBIO ResetOwnership IOCTL\n"
++                       "which routes to DoUnpairing inside the Lenovo DLL.\n"
++                       "If the sensor was paired with a different host (e.g.\n"
++                       "the original Windows install), this should clear that\n"
++                       "pairing from sensor NVRAM. Continue? (y/n): ");
++                char yn = 0;
++                /* The leading space in " %c" skips whitespace (including the
++                 * leftover '\n' from the 'u' keystroke that lands us here). */
++                if(scanf(" %c", &yn) != 1) { puts("Aborted unpair"); goto cmdend; }
++                while(!abort_cmd_loop && getchar() != '\n') continue;
++                if(yn != 'y') { puts("Aborted unpair"); goto cmdend; }
++
++                if(tudor_unpair(device)) {
++                    puts("Unpair dispatched successfully (HRESULT 0). Try enroll now.");
++                } else {
++                    puts("Unpair dispatch returned an error — see [INF] line above for hres/op_status.");
++                }
++            } goto cmdend;
++            case 'p': {
++                printf("Dispatch WBIO IOCTL 0x44002C (OnConnectSecure -> pair flow). Continue? (y/n): ");
++                char yn = 0;
++                if(scanf(" %c", &yn) != 1) { puts("Aborted pair"); goto cmdend; }
++                while(!abort_cmd_loop && getchar() != '\n') continue;
++                if(yn != 'y') { puts("Aborted pair"); goto cmdend; }
++
++                if(tudor_pair(device)) {
++                    puts("Pair dispatched successfully (HRESULT 0). Try enroll now.");
++                } else {
++                    puts("Pair dispatch returned an error — see [INF] line above.");
++                }
++            } goto cmdend;
+             case 's': abort_cmd_loop = true; goto cmdend;
+             default: printf("Unknown command '%c'!\n", cmd);
+         }
+diff --git a/cli/src/main.c b/cli/src/main.c
+index d06106c..0bf470e 100644
+--- a/cli/src/main.c
++++ b/cli/src/main.c
+@@ -12,7 +12,7 @@
+ #include "cli.h"
+ 
+ #define TUDOR_VID 0x06cb
+-#define TUDOR_PID 0x00be
++#define TUDOR_PID 0x00e7
+ 
+ static bool drop_root_priv() {
+     if(geteuid() == 0 || getegid() == 0) {
+diff --git a/libfprint-tod/60-tudor-libfprint-tod.rules b/libfprint-tod/60-tudor-libfprint-tod.rules
+index 2ee7b8e..261ef4a 100644
+--- a/libfprint-tod/60-tudor-libfprint-tod.rules
++++ b/libfprint-tod/60-tudor-libfprint-tod.rules
+@@ -1,2 +1,2 @@
+-SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00be", ATTRS{dev}=="*", TEST=="power/control", ATTR{power/control}="auto", MODE="0660", GROUP="plugdev"
+-SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00be", ENV{LIBFPRINT_DRIVER}="Tudor TOD"
+\ No newline at end of file
++SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00e7", ATTRS{dev}=="*", TEST=="power/control", ATTR{power/control}="auto", MODE="0660", GROUP="plugdev"
++SUBSYSTEM=="usb", ATTRS{idVendor}=="06cb", ATTRS{idProduct}=="00e7", ENV{LIBFPRINT_DRIVER}="Tudor TOD"
+diff --git a/libfprint-tod/src/device.c b/libfprint-tod/src/device.c
+index fbe7010..9b0929b 100644
+--- a/libfprint-tod/src/device.c
++++ b/libfprint-tod/src/device.c
+@@ -14,6 +14,7 @@ GType fpi_tod_shared_driver_get_type() {
+ 
+ static FpIdEntry tudor_ids[] = {
+     { .vid = 0x06cb, .pid = 0x00be },
++    { .vid = 0x06cb, .pid = 0x00e7 },
+ //  { .vid = 0x06cb, .pid = 0x00bd }, //TODO Check if it's also supported
+     { 0 }
+ };
+diff --git a/libtudor/download_driver.sh b/libtudor/download_driver.sh
+old mode 100644
+new mode 100755
+index 4450786..9650273
+--- a/libtudor/download_driver.sh
++++ b/libtudor/download_driver.sh
+@@ -7,19 +7,31 @@ DLLS=${@:4}
+ 
+ mkdir -p "$TMP_DIR"
+ 
+-#Download the driver executable and check hash
++# Lenovo r19fp02w — Synaptics Fingerprint Sensor Driver (original synaTudor
++# target, for 06cb:00be sensors). Swapped in to test whether the Lenovo DLL
++# happens to have a qm struct that matches our HP 06cb:00e7 sensor's MFW,
++# given that all three tested HP softpaqs (sp102181/sp105739/sp111400) hit
++# the same "Mismatch of qm struct size on host and MFW" wall during enroll.
+ INSTALLER="$TMP_DIR/installer.exe"
+-wget https://download.lenovo.com/pccbbs/mobiles/r19fp02w.exe -O "$INSTALLER"
++wget -q https://download.lenovo.com/pccbbs/mobiles/r19fp02w.exe -O "$INSTALLER"
+ shasum "$INSTALLER" | cut -d" " -f1 | cmp - "$HASH_FILE"
+ 
+-#Extract the driver
++# Lenovo wraps the payload as an Inno Setup installer (unlike HP's softpaq
++# wrapper); innoextract handles it cleanly.
+ WINDRV="$TMP_DIR/windrv"
++rm -rf "$WINDRV"
+ mkdir -p "$WINDRV"
+-innoextract -d "$WINDRV" "$INSTALLER"
++innoextract -d "$WINDRV" "$INSTALLER" >/dev/null
+ 
+-#Copy outputs
++# Lenovo's DLLs ship with the "104" suffix natively — that's where the
++# symbol names in libtudor/src/tudor/driver.c originally came from. No
++# rename map needed.
+ mkdir -p "$OUT_DIR"
+-for dll in $DLLS
+-do
+-    cp $(find "$WINDRV" -name "$dll") "$OUT_DIR/$dll"
+-done
+\ No newline at end of file
++for dll in $DLLS; do
++    src_path=$(find "$WINDRV" -iname "$dll" -print -quit)
++    if [ -z "$src_path" ]; then
++        echo "download_driver.sh: could not find $dll in extracted Lenovo softpaq" >&2
++        exit 1
++    fi
++    cp "$src_path" "$OUT_DIR/$dll"
++done
+diff --git a/libtudor/inc/tudor/tudor.h b/libtudor/inc/tudor/tudor.h
+index 56b532c..c473654 100644
+--- a/libtudor/inc/tudor/tudor.h
++++ b/libtudor/inc/tudor/tudor.h
+@@ -94,6 +94,17 @@ struct tudor_device {
+ bool tudor_open(struct tudor_device *device, libusb_device_handle *usb_dev, struct tudor_device_state *state);
+ bool tudor_close(struct tudor_device *device);
+ 
++/* Dispatch the WBIO sensor adapter's IOCTL 0x442040 — the OnResetOwnership /
++ * DoUnpairing path discovered by reversing synaEvtIoDeviceControl in the
++ * Lenovo synaWudfBioUsb104.dll. Returns true if the DLL accepted the call
++ * (HRESULT==0); the actual unpair side-effect on sensor NVRAM is only
++ * observable on subsequent operations. */
++bool tudor_unpair(struct tudor_device *device);
++
++/* IOCTL 0x44002C → CBiometricDevice::OnConnectSecure, which on this DLL
++ * triggers the pair flow when no pairing data is present on the host. */
++bool tudor_pair(struct tudor_device *device);
++
+ int tudor_wipe_records(struct tudor_device *device, RECGUID *guid, enum tudor_finger finger);
+ bool tudor_add_record(struct tudor_device *device, RECGUID guid, enum tudor_finger finger, const void *data, size_t data_size);
+ 
+diff --git a/libtudor/src/tudor/device.c b/libtudor/src/tudor/device.c
+index 48f4352..45079d3 100644
+--- a/libtudor/src/tudor/device.c
++++ b/libtudor/src/tudor/device.c
+@@ -139,6 +139,96 @@ bool tudor_open(struct tudor_device *device, libusb_device_handle *usb_dev, stru
+     return true;
+ }
+ 
++bool tudor_unpair(struct tudor_device *device) {
++    /* The WBIO sensor adapter's ControlUnit has a hardcoded allowlist of
++     * IOCTL codes (0x440020, 0x440024, 0x44240C, 0x442410, 0x442480) and
++     * rejects anything else with E_INVALIDARG — so 0x442040 (ResetOwnership)
++     * can't reach the WUDF driver through that path. Instead, dispatch
++     * directly via winwdf_devctrl_file, which mirrors what wbiosrvc.exe
++     * would do on Windows: open the WDF device file and send the raw IOCTL.
++     * Lands at synaEvtIoDeviceControl -> CBiometricDevice::OnResetOwnership
++     * -> DoUnpairing. */
++
++    /* WINBIO_IDENTITY as input — type WILDCARD means "any user". */
++    WINBIO_IDENTITY ident = {0};
++    ident.Type = WINBIO_ID_TYPE_WILDCARD;
++    ident.Wildcard = 0;
++
++    UCHAR recv_buf[256] = {0};
++
++    log_info("WBIO unpair | direct WDF dispatch of IOCTL 0x442040 with WINBIO_IDENTITY (WILDCARD)...");
++
++    /* Match the same module/threading dance tudor_devctrl uses for normal
++     * pipeline IOCTLs (see lines ~38 of device.c). */
++    winmodule_set_cur(&tudor_driver_dll->module);
++
++    struct winwdf_request *req = NULL;
++    NTSTATUS status = winwdf_devctrl_file(device->wdf_file, 0x442040,
++        &ident, sizeof(ident),
++        recv_buf, sizeof(recv_buf),
++        &req);
++    log_info("WBIO unpair | initial winwdf_devctrl_file status=0x%x req=%p", (unsigned) status, (void *) req);
++
++    if(status != STATUS_SUCCESS) return false;
++
++    /* Drive the WDF event queue so the IOCTL dispatcher actually runs. */
++    winwdf_event_queue_flush();
++
++    /* Now read out the request result. */
++    if(req) {
++        NTSTATUS req_status = STATUS_PENDING;
++        const void *in_buf = NULL, *out_buf = NULL;
++        size_t in_size = 0, out_size = 0;
++        ULONG_PTR drv_info = 0;
++        winwdf_get_request_info(req, &req_status, &in_buf, &in_size, &out_buf, &out_size, &drv_info);
++        log_info("WBIO unpair | req_status=0x%x bytes_transferred=%zu out_buf=%p out_size=%zu",
++            (unsigned) req_status, (size_t) drv_info, out_buf, out_size);
++        return req_status == STATUS_SUCCESS;
++    }
++    return false;
++}
++
++bool tudor_pair(struct tudor_device *device) {
++    /* IOCTL 0x44002C → synaEvtIoDeviceControl dispatch arm at VA 0x18001e5e7
++     * → CBiometricDevice::OnConnectSecure at VA 0x18001de08. When the host
++     * has no pairing data, OnConnectSecure triggers the pairing handshake
++     * (which in turn calls DoPairing internally). After unpair via 0x442040,
++     * the next "Need to perform pairing" failure is expected to be resolved
++     * by this IOCTL. */
++
++    WINBIO_IDENTITY ident = {0};
++    ident.Type = WINBIO_ID_TYPE_WILDCARD;
++    ident.Wildcard = 0;
++
++    UCHAR recv_buf[256] = {0};
++
++    log_info("WBIO pair | direct WDF dispatch of IOCTL 0x44002C (OnConnectSecure)...");
++    winmodule_set_cur(&tudor_driver_dll->module);
++
++    struct winwdf_request *req = NULL;
++    NTSTATUS status = winwdf_devctrl_file(device->wdf_file, 0x44002C,
++        &ident, sizeof(ident),
++        recv_buf, sizeof(recv_buf),
++        &req);
++    log_info("WBIO pair | initial winwdf_devctrl_file status=0x%x req=%p", (unsigned) status, (void *) req);
++
++    if(status != STATUS_SUCCESS) return false;
++
++    winwdf_event_queue_flush();
++
++    if(req) {
++        NTSTATUS req_status = STATUS_PENDING;
++        const void *in_buf = NULL, *out_buf = NULL;
++        size_t in_size = 0, out_size = 0;
++        ULONG_PTR drv_info = 0;
++        winwdf_get_request_info(req, &req_status, &in_buf, &in_size, &out_buf, &out_size, &drv_info);
++        log_info("WBIO pair | req_status=0x%x bytes_transferred=%zu out_buf=%p out_size=%zu",
++            (unsigned) req_status, (size_t) drv_info, out_buf, out_size);
++        return req_status == STATUS_SUCCESS;
++    }
++    return false;
++}
++
+ bool tudor_close(struct tudor_device *device) {
+     HRESULT hres;
+ 
+diff --git a/libtudor/src/tudor/reg.c b/libtudor/src/tudor/reg.c
+index 7c90208..7520681 100644
+--- a/libtudor/src/tudor/reg.c
++++ b/libtudor/src/tudor/reg.c
+@@ -1,3 +1,4 @@
++#include <strings.h>
+ #include "internal.h"
+ 
+ const struct tudor_pair_data *(*tudor_get_pdata_fnc)(const char *name);
+@@ -6,9 +7,23 @@ void (*tudor_set_pdata_fnc)(const char *name, const struct tudor_pair_data *pdat
+ bool tudor_reg_handler(void *ctx, void *ctx_obj, const char *key_name, const char *val_name, bool is_write, void *buf, size_t *buf_size, enum winreg_val_type *val_type) {
+     if(!buf_size) return false;
+ 
++    //Pretend to be a Windows host so the driver has a stable identity to pair against.
++    if(!is_write && strcasecmp(key_name, "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography") == 0) {
++        if(strcasecmp(val_name, "MachineGuid") == 0) {
++            static const char16_t machine_guid_w[] = u"120cf559-12ff-4926-860a-1199dddbd14c";
++            if(buf && *buf_size >= sizeof(machine_guid_w)) {
++                memcpy(buf, machine_guid_w, sizeof(machine_guid_w));
++            } else if(buf) return false;
++            *buf_size = sizeof(machine_guid_w);
++            *val_type = WINREG_STR;
++            return true;
++        }
++        return false;
++    }
++
+     //Handle the driver configuration key
+-    if(!is_write && strcmp(key_name, "HKEY_LOCAL_MACHINE\\SOFTWARE\\Syna") == 0) {
+-        if(strcmp(val_name, "wbfMode") == 0) {
++    if(!is_write && strcasecmp(key_name, "HKEY_LOCAL_MACHINE\\SOFTWARE\\Syna") == 0) {
++        if(strcasecmp(val_name, "wbfMode") == 0) {
+             if(buf && *buf_size >= 4) {
+                 *((uint32_t*) buf) = TRUE;
+             } else if(buf) return false;
+@@ -16,7 +31,7 @@ bool tudor_reg_handler(void *ctx, void *ctx_obj, const char *key_name, const cha
+             *val_type = WINREG_DWORD;
+             return true;
+         }
+-        if(strcmp(val_name, "useWbf") == 0) {
++        if(strcasecmp(val_name, "useWbf") == 0) {
+             if(buf && *buf_size >= 4) {
+                 *((uint32_t*) buf) = TRUE;
+             } else if(buf) return false;
+@@ -31,7 +46,7 @@ bool tudor_reg_handler(void *ctx, void *ctx_obj, const char *key_name, const cha
+     if(strcmp(key_name, "HKEY_LOCAL_MACHINE\\Tudor\\Device") == 0 && ctx_obj) {
+         struct tudor_device *dev = (struct tudor_device*) ctx_obj;
+ 
+-        if(strcmp(val_name, "PairingInProcess") == 0) {
++        if(strcasecmp(val_name, "PairingInProcess") == 0) {
+             if(buf && *buf_size >= 4) {
+                 if(!is_write) *((int*) buf) = dev->state.pairing_in_process;
+                 else dev->state.pairing_in_process = *((int*) buf) != 0;
+@@ -39,7 +54,7 @@ bool tudor_reg_handler(void *ctx, void *ctx_obj, const char *key_name, const cha
+             *buf_size = 4;
+             if(!is_write) *val_type = WINREG_DWORD;
+             return true;
+-        } else if(strcmp(val_name, "UnairingInProcess") == 0) {
++        } else if(strcasecmp(val_name, "UnairingInProcess") == 0) {
+             if(buf && *buf_size >= 4) {
+                 if(!is_write) *((int*) buf) = dev->state.unpairing_in_process;
+                 else dev->state.unpairing_in_process = *((int*) buf) != 0;
+@@ -47,7 +62,7 @@ bool tudor_reg_handler(void *ctx, void *ctx_obj, const char *key_name, const cha
+             *buf_size = 4;
+             if(!is_write) *val_type = WINREG_DWORD;
+             return true;
+-        } else if(strcmp(val_name, "DeviceUpdateInProcess") == 0) {
++        } else if(strcasecmp(val_name, "DeviceUpdateInProcess") == 0) {
+             if(buf && *buf_size >= 4) {
+                 if(!is_write) *((int*) buf) = dev->state.update_in_process;
+                 else dev->state.update_in_process = *((int*) buf) != 0;
+@@ -55,7 +70,7 @@ bool tudor_reg_handler(void *ctx, void *ctx_obj, const char *key_name, const cha
+             *buf_size = 4;
+             if(!is_write) *val_type = WINREG_DWORD;
+             return true;
+-        } else if(strcmp(val_name, "deviceInitializeFailures") == 0) {
++        } else if(strcasecmp(val_name, "deviceInitializeFailures") == 0) {
+             if(buf && *buf_size >= 4) {
+                 if(!is_write) *((int*) buf) = dev->state.init_fails;
+                 else dev->state.init_fails = *((int*) buf);
+@@ -63,7 +78,7 @@ bool tudor_reg_handler(void *ctx, void *ctx_obj, const char *key_name, const cha
+             *buf_size = 4;
+             if(!is_write) *val_type = WINREG_DWORD;
+             return true;
+-        } else if(strcmp(val_name, "updateFirmwareFailureCount") == 0) {
++        } else if(strcasecmp(val_name, "updateFirmwareFailureCount") == 0) {
+             if(buf && *buf_size >= 4) {
+                 if(!is_write) *((int*) buf) = dev->state.update_fails;
+                 else dev->state.update_fails = *((int*) buf);
+@@ -71,7 +86,7 @@ bool tudor_reg_handler(void *ctx, void *ctx_obj, const char *key_name, const cha
+             *buf_size = 4;
+             if(!is_write) *val_type = WINREG_DWORD;
+             return true;
+-        } else if(strcmp(val_name, "LastUpdateSystemTimeStamp") == 0) {
++        } else if(strcasecmp(val_name, "LastUpdateSystemTimeStamp") == 0) {
+             if(buf && *buf_size >= 4) {
+                 if(!is_write) *((uint32_t*) buf) = dev->state.last_update_timestamp;
+                 else dev->state.last_update_timestamp = *((uint32_t*) buf);
+@@ -100,6 +115,7 @@ bool tudor_reg_handler(void *ctx, void *ctx_obj, const char *key_name, const cha
+             }
+         } else {
+             if(tudor_set_pdata_fnc) {
++                log_info("PDATA-WRITE | sensor '%s' size %lu buf %p", val_name, *buf_size, buf);
+                 tudor_set_pdata_fnc(val_name, &(struct tudor_pair_data) {
+                     .data = buf,
+                     .data_size = *buf_size
+diff --git a/libtudor/src/tudor/storage.c b/libtudor/src/tudor/storage.c
+index d1a0827..6abd90d 100644
+--- a/libtudor/src/tudor/storage.c
++++ b/libtudor/src/tudor/storage.c
+@@ -91,7 +91,7 @@ __winfnc static HRESULT storage_AddRecord(WINBIO_PIPELINE *pipeline, WINBIO_STOR
+     if(srec->Identity->Type != WINBIO_ID_TYPE_GUID) return E_INVALIDARG;
+     if(srec->IndexElementCount != 0 || srec->PayloadBlobSize != 0) return E_INVALIDARG;
+ 
+-    log_verbose("WINBIO storage | AddRecord(guid=%08x... subfactor=%x) called", srec->Identity->TemplateGuid.PartA, srec->SubFactor);
++    log_info("WINBIO storage | AddRecord(guid=%08x... subfactor=%x) TemplateBlobSize=%zu TemplateBlob=%p PayloadBlobSize=%zu IndexElementCount=%zu", srec->Identity->TemplateGuid.PartA, srec->SubFactor, (size_t) srec->TemplateBlobSize, srec->TemplateBlob, (size_t) srec->PayloadBlobSize, (size_t) srec->IndexElementCount);
+     cant_fail_ret(pthread_mutex_lock(&dev->records_lock));
+ 
+     //Check for duplicate record
+diff --git a/libtudor/src/winapi/bcrypt/bcrypt.c b/libtudor/src/winapi/bcrypt/bcrypt.c
+index c988fc0..9265a0b 100644
+--- a/libtudor/src/winapi/bcrypt/bcrypt.c
++++ b/libtudor/src/winapi/bcrypt/bcrypt.c
+@@ -422,7 +422,7 @@ __winfnc NTSTATUS BCryptDeriveKey(struct bcrypt_secret *secret, const char16_t *
+         const EVP_MD *hash_md = determine_hash_md(params);
+         if(!hash_md) hash_md = EVP_sha1();
+ 
+-        if(key && key_size >= EVP_MD_size(hash_md)) return STATUS_BUFFER_TOO_SMALL;
++        if(key && key_size < EVP_MD_size(hash_md)) return STATUS_BUFFER_TOO_SMALL;
+         else if(!key) {
+             *res_size = EVP_MD_size(hash_md);
+             return STATUS_SUCCESS;
+@@ -459,7 +459,7 @@ __winfnc NTSTATUS BCryptDeriveKey(struct bcrypt_secret *secret, const char16_t *
+         const EVP_MD *hash_md = determine_hash_md(params);
+         if(!hash_md) hash_md = EVP_sha1();
+ 
+-        if(key && key_size >= EVP_MD_size(hash_md)) return STATUS_BUFFER_TOO_SMALL;
++        if(key && key_size < EVP_MD_size(hash_md)) return STATUS_BUFFER_TOO_SMALL;
+         else if(!key) {
+             *res_size = EVP_MD_size(hash_md);
+             return STATUS_SUCCESS;
+diff --git a/libtudor/src/winapi/crypt/crypt.c b/libtudor/src/winapi/crypt/crypt.c
+index b842dc4..a015ca0 100644
+--- a/libtudor/src/winapi/crypt/crypt.c
++++ b/libtudor/src/winapi/crypt/crypt.c
+@@ -4,6 +4,7 @@
+ 
+ __winfnc BOOL CryptAcquireContextA(struct crypt_provider **prov, const char *cont_name, const char *prov_name, DWORD prov_type, DWORD flags) {
+     switch(prov_type) {
++        case PROV_RSA_FULL:
+         case PROV_RSA_AES: *prov = &crypt_prov_rsa_aes; return TRUE;
+         default: {
+             log_warn("CryptAcquireContextA | Couldn't find provider for container '%s' provider '%s' provider type 0x%x flags 0x%x", cont_name, prov_name, prov_type, flags);
+@@ -13,6 +14,16 @@ __winfnc BOOL CryptAcquireContextA(struct crypt_provider **prov, const char *con
+ }
+ WINAPI(CryptAcquireContextA)
+ 
++__winfnc BOOL CryptAcquireContextW(struct crypt_provider **prov, const char16_t *cont_name, const char16_t *prov_name, DWORD prov_type, DWORD flags) {
++    char *c = winstr_to_str(cont_name);
++    char *p = winstr_to_str(prov_name);
++    BOOL ret = CryptAcquireContextA(prov, c, p, prov_type, flags);
++    free(c);
++    free(p);
++    return ret;
++}
++WINAPI(CryptAcquireContextW)
++
+ __winfnc BOOL CryptReleaseContext(struct crypt_provider *prov, DWORD flags) {
+     return TRUE;
+ }
+diff --git a/libtudor/src/winapi/reg.c b/libtudor/src/winapi/reg.c
+index 427882e..d733d18 100644
+--- a/libtudor/src/winapi/reg.c
++++ b/libtudor/src/winapi/reg.c
+@@ -67,7 +67,7 @@ bool winreg_query_val(HANDLE hkey, const char *val_name, void *buf, size_t *buf_
+ 
+     //Forward to registry handler
+     bool suc = reg_handler(reg_context, key->ctx_obj, key->name, val_name, false, buf, buf_size, val_type);
+-    log_verbose("REGREAD  | ctx %18p key '%s' value '%s' val type %d buf size %lu suc %d", key->ctx_obj, key->name, val_name, *val_type, *buf_size, suc);
++    log_info("REGREAD  | key '%s' value '%s' val type %d buf size %lu suc %d", key->name, val_name, *val_type, *buf_size, suc);
+     return suc;
+ }
+ 
+@@ -75,9 +75,10 @@ bool winreg_write_val(HANDLE hkey, const char *val_name, const void *buf, size_t
+     struct reg_key *key = (struct reg_key*) hkey->data;
+     if(!reg_handler) return false;
+ 
++    log_info("REGWRITE-IN | key '%s' value '%s' val type %d buf size %lu", key->name, val_name, val_type, buf_size);
+     //Forward to registry handler
+     bool suc = reg_handler(reg_context, key->ctx_obj, key->name, val_name, true, (void*) buf, &buf_size, &val_type);
+-    log_verbose("REGWRITE | ctx %18p key '%s' value '%s' val type %d buf size %lu suc %d", key->ctx_obj, key->name, val_name, val_type, buf_size, suc);
++    log_info("REGWRITE-OUT| key '%s' value '%s' val type %d buf size %lu suc %d", key->name, val_name, val_type, buf_size, suc);
+     return suc;
+ }
+ 
+diff --git a/libtudor/src/winapi/suspend.c b/libtudor/src/winapi/suspend.c
+index 25e20e9..e4b08bb 100644
+--- a/libtudor/src/winapi/suspend.c
++++ b/libtudor/src/winapi/suspend.c
+@@ -18,4 +18,15 @@ __winfnc DWORD PowerUnregisterSuspendResumeNotification(HANDLE handle) {
+     //TODO
+     return ERROR_SUCCESS;
+ }
+-WINAPI(PowerUnregisterSuspendResumeNotification)
+\ No newline at end of file
++WINAPI(PowerUnregisterSuspendResumeNotification)
++
++__winfnc DWORD PowerSettingRegisterNotification(const void *setting_guid, DWORD flags, HANDLE recipient, HANDLE *out) {
++    if(out) *out = (HANDLE) 1;
++    return ERROR_SUCCESS;
++}
++WINAPI(PowerSettingRegisterNotification)
++
++__winfnc DWORD PowerSettingUnregisterNotification(HANDLE handle) {
++    return ERROR_SUCCESS;
++}
++WINAPI(PowerSettingUnregisterNotification)
+\ No newline at end of file
+diff --git a/libtudor/src/winapi/wdf/device.c b/libtudor/src/winapi/wdf/device.c
+index ffd727a..29ed979 100644
+--- a/libtudor/src/winapi/wdf/device.c
++++ b/libtudor/src/winapi/wdf/device.c
+@@ -362,4 +362,14 @@ __winfnc NTSTATUS WdfDeviceRetrieveDeviceInterfaceString(WDF_DRIVER_GLOBALS *glo
+     wdf_set_string((struct wdf_string*) str, buf);
+     return STATUS_SUCCESS;
+ }
+-WDFFUNC(WdfDeviceRetrieveDeviceInterfaceString, 29)
+\ No newline at end of file
++WDFFUNC(WdfDeviceRetrieveDeviceInterfaceString, 29)
++
++__winfnc NTSTATUS WdfDeviceAssignInterfaceProperty(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, void *property_data, ULONG type, ULONG buffer_length, void *property_buffer) { return STATUS_SUCCESS; }
++WDFFUNC(WdfDeviceAssignInterfaceProperty, 50)
++
++__winfnc NTSTATUS WdfDeviceAllocAndQueryInterfaceProperty(WDF_DRIVER_GLOBALS *globals, WDFOBJECT device_obj, void *property_data, ULONG pool_type, void *property_memory_attributes, WDFOBJECT *property_memory, ULONG *type) {
++    if(property_memory) *property_memory = NULL;
++    if(type) *type = 0;
++    return STATUS_OBJECT_NAME_NOT_FOUND;
++}
++WDFFUNC(WdfDeviceAllocAndQueryInterfaceProperty, 51)
+\ No newline at end of file
+diff --git a/libtudor/src/winapi/windows.h b/libtudor/src/winapi/windows.h
+index 46275e9..18ef5ee 100644
+--- a/libtudor/src/winapi/windows.h
++++ b/libtudor/src/winapi/windows.h
+@@ -62,6 +62,7 @@ enum {
+     STATUS_PENDING = 0x00000103,
+     STATUS_CANCELLED = 0xc0000120,
+     STATUS_BUFFER_TOO_SMALL = 0xc0000023,
++    STATUS_OBJECT_NAME_NOT_FOUND = 0xc0000034,
+     STATUS_INVALID_SIGNATURE = 0xc000a000
+ };
+ 
