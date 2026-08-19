@@ -343,6 +343,18 @@ static int snapshot_has(const struct guid_snapshot *g, const uint8_t guid[16])
 	return 0;
 }
 
+static int snapshot_capture(struct fp_session *s, struct guid_snapshot *out,
+                           const char *tag)
+{
+	out->n = 0;
+	int rc = fp_proto_list(s, guid_snapshot_cb, out);
+	if (rc < 0) {
+		fprintf(stderr, "proto: %s snapshot failed\n", tag ? tag : "guid");
+		return -1;
+	}
+	return 0;
+}
+
 int fp_proto_enroll(struct fp_session *s, uint8_t finger_subtype,
                     const uint8_t *sid, int sid_len,
                     fp_proto_enroll_cb cb, void *user,
@@ -362,7 +374,8 @@ int fp_proto_enroll(struct fp_session *s, uint8_t finger_subtype,
 	/* Snapshot existing finger GUIDs so we can tell which one the sensor
 	 * creates for this enrollment. */
 	struct guid_snapshot before = { .n = 0 };
-	fp_proto_list(s, guid_snapshot_cb, &before);
+	if (snapshot_capture(s, &before, "pre-enroll") != 0)
+		return -1;
 
 	/* Priming commands Windows sends before misEnrollStart. */
 	prime_image_metrics(s);
@@ -455,9 +468,15 @@ int fp_proto_enroll(struct fp_session *s, uint8_t finger_subtype,
 	}
 
 	int cstat = app_cmd(s, commit, sizeof(commit), resp, sizeof(resp), &n);
-	app_cmd(s, fin_cmd, sizeof(fin_cmd), resp, sizeof(resp), &n);
+	int fstat = app_cmd(s, fin_cmd, sizeof(fin_cmd), resp, sizeof(resp), &n);
 	if (!fp_status_is_ok(cstat)) {
 		fprintf(stderr, "proto: misEnrollCommit status=0x%04x\n", cstat);
+		return -1;
+	}
+	/* 0x0404 = nothing-to-finish (already committed); anything else non-OK
+	 * means the template was not persisted to NVRAM. */
+	if (!fp_status_is_ok(fstat) && fstat != 0x0404) {
+		fprintf(stderr, "proto: misEnrollFinish status=0x%04x\n", fstat);
 		return -1;
 	}
 	/* The sensor assigns its own finger-object GUID at commit (ignoring the
@@ -467,7 +486,12 @@ int fp_proto_enroll(struct fp_session *s, uint8_t finger_subtype,
 	 * Prefer a newly-appeared GUID; fall back to the finger matching this
 	 * subtype, then to the requested GUID. */
 	struct guid_snapshot after = { .n = 0 };
-	fp_proto_list(s, guid_snapshot_cb, &after);
+	if (snapshot_capture(s, &after, "post-enroll") != 0) {
+		/* Commit already succeeded: the sensor may now hold a template with
+		 * no matching disk print. `fpdrv clear` reclaims it. */
+		fprintf(stderr, "proto: committed template may be orphaned on sensor\n");
+		return -1;
+	}
 
 	int new_idx = -1, subtype_idx = -1;
 	for (int i = 0; i < after.n; i++) {
@@ -478,10 +502,18 @@ int fp_proto_enroll(struct fp_session *s, uint8_t finger_subtype,
 		}
 	}
 	int pick = (new_idx >= 0) ? new_idx : subtype_idx;
-	if (pick >= 0) memcpy(guid, after.guids[pick], 16);
+	if (pick < 0) {
+		/* The new template is not visible in the sensor DB. Either the
+		 * commit was not persisted or the post-commit enumeration failed.
+		 * Report as a protocol error so fprintd does not store a stale
+		 * GUID that will disappear after the next power cycle. */
+		fprintf(stderr, "proto: enrollment not visible in sensor DB after commit\n");
+		return -1;
+	}
+	memcpy(guid, after.guids[pick], 16);
 
 	if (out_guid) memcpy(out_guid, guid, 16);
-	DBG("proto: enroll committed\n");
+	DBG("proto: enroll committed and verified in sensor DB\n");
 	return 0;
 }
 
@@ -495,30 +527,67 @@ int fp_proto_list(struct fp_session *s, fp_proto_list_cb cb, void *user)
 	uint8_t list_users[21] = { 0x9f, 0x02, 0x00, 0x00, 0x00 };
 	memset(list_users + 5, 0xff, 16);
 	int st = app_cmd(s, list_users, sizeof(list_users), resp, sizeof(resp), &n);
-	if (!fp_status_is_ok(st)) return -1;
-	unsigned ucount = (n >= 4) ? (resp[2] | (resp[3] << 8)) : 0;
+	if (!fp_status_is_ok(st)) {
+		DBG("proto: user-list status=0x%04x\n", st);
+		return -1;
+	}
+	if (n < 4) {
+		DBG("proto: user-list short (%d bytes)\n", n);
+		return -1;
+	}
+	unsigned ucount = resp[2] | (resp[3] << 8);
+	int users_need = 4 + (int)(ucount * 16u);
+	if (users_need > n) {
+		DBG("proto: user-list malformed count=%u len=%d\n", ucount, n);
+		return -1;
+	}
 
 	/* Copy user GUIDs out before reusing resp. */
 	uint8_t uguids[64][16];
-	if (ucount > 64) ucount = 64;
-	for (unsigned u = 0; u < ucount && (int)(4 + (u + 1) * 16) <= n; u++)
+	if (ucount > 64) {
+		DBG("proto: user-list count=%u clamped to 64\n", ucount);
+		ucount = 64;
+	}
+	for (unsigned u = 0; u < ucount; u++)
 		memcpy(uguids[u], resp + 4 + u * 16, 16);
 
 	for (unsigned u = 0; u < ucount; u++) {
 		uint8_t list_f[21] = { 0x9f, 0x03, 0x00, 0x00, 0x00 };
 		memcpy(list_f + 5, uguids[u], 16);
 		uint8_t fresp[1024];
-		int fn = fp_tls_app_send_recv(&s->st, &s->xport, list_f, sizeof(list_f), fresp, sizeof(fresp));
-		unsigned fcount = (fn >= 4) ? (fresp[2] | (fresp[3] << 8)) : 0;
-		for (unsigned f = 0; f < fcount && (int)(4 + (f + 1) * 16) <= fn; f++) {
+		int fn = 0;
+		int fst = app_cmd(s, list_f, sizeof(list_f), fresp, sizeof(fresp), &fn);
+		if (!fp_status_is_ok(fst)) {
+			DBG("proto: finger-list for user %u status=0x%04x\n", u, fst);
+			return -1;
+		}
+		if (fn < 4) {
+			DBG("proto: finger-list for user %u short (%d bytes)\n", u, fn);
+			return -1;
+		}
+		unsigned fcount = fresp[2] | (fresp[3] << 8);
+		int fingers_need = 4 + (int)(fcount * 16u);
+		if (fingers_need > fn) {
+			DBG("proto: finger-list for user %u malformed count=%u len=%d\n", u, fcount, fn);
+			return -1;
+		}
+		for (unsigned f = 0; f < fcount; f++) {
 			uint8_t fg[16];
 			memcpy(fg, fresp + 4 + f * 16, 16);
 			/* Read finger object data to recover the WinBio subtype. */
 			uint8_t od[21] = { 0xa1, 0x03, 0x00, 0x00, 0x00 };
 			memcpy(od + 5, fg, 16);
 			uint8_t oresp[1024];
-			int on = fp_tls_app_send_recv(&s->st, &s->xport, od, sizeof(od), oresp, sizeof(oresp));
-			uint8_t subtype = (on >= 36) ? oresp[35] : 1;
+			int on = 0;
+			int ost = app_cmd(s, od, sizeof(od), oresp, sizeof(oresp), &on);
+			/* A single unreadable record (e.g. orphan from a failed commit)
+			 * must not fail the whole listing; fall back to subtype 1. */
+			uint8_t subtype = 1;
+			if (!fp_status_is_ok(ost) || on < 36)
+				DBG("proto: finger-object for user %u finger %u unreadable (status=0x%04x len=%d)\n",
+				    u, f, ost, on);
+			else
+				subtype = oresp[35];
 			count++;
 			if (cb && cb(uguids[u], fg, subtype, user)) return count;
 		}
